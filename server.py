@@ -12,7 +12,7 @@ class Server:
     def __init__(self, HOST, TCP_PORT):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.bind((HOST, TCP_PORT))
-        self.socket.listen() # can put a number here to limit max connections
+        self.socket.listen()  # can put a number here to limit max connections
         print(f"Server is waiting for connections on {TCP_PORT}...\n")
 
     def listen(self):
@@ -26,8 +26,6 @@ class Server:
             client = {'cli_name': cli_name, 'cli_sock': cli_sock}
 
             # TODO: Create a chatroom or join an existing chatroom
-            # Broadcast new client connection
-            self.broadcast_message(cli_name, "Welcome " + cli_name + " to the server!\n")
             Server.clients.append(client)
             Thread(target=self.handle_new_client, args=(client,)).start()
 
@@ -35,24 +33,28 @@ class Server:
         cli_name = client['cli_name']
         cli_sock = client['cli_sock']
 
+        # Broadcast new client connection
+        self.broadcast(cli_name, "Welcome " + cli_name + " to the server!\n", svr_msg=True)
+
+        # TODO: integrate web interface for message sending/viewing
         while True:
             # Listen for messages, broadcast to all clients in the chat
             cli_msg = cli_sock.recv(1024).decode()
 
             # If message is /leave, remove client and close socket
             if cli_msg.strip() == cli_name + ": /leave" or not cli_msg.strip():
-                self.broadcast_message(cli_name, cli_name + " has left the server.\n")
+                self.broadcast(cli_name, cli_name + " has left the server.\n", svr_msg=True)
                 Server.clients.remove(client)
                 cli_sock.close()
                 break
             else:
-                self.broadcast_message(cli_name, cli_msg)
+                self.broadcast(cli_name, cli_msg)
 
-    def broadcast_message(self, sender, message):
+    def broadcast(self, sender, message, svr_msg=False):
         for cli in self.clients:
             cli_sock = cli['cli_sock']
             cli_name = cli['cli_name']
-            if cli_name != sender:
+            if cli_name != sender or svr_msg:
                 cli_sock.send(message.encode())
 
 # Flask Server (Web Interface)
@@ -66,6 +68,7 @@ def hello():
 def launch_server(HOST, PORT):
     server = Server(HOST, PORT)
     server.listen()
+
 
 if __name__ == '__main__':
     # TODO: Parse arguments
