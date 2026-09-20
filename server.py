@@ -82,28 +82,8 @@ class Server:
             Server.clients.append(client)
             Thread(target=self.handle_new_client, args=(client,)).start()
 
-    def handle_new_client(self, client):
-        cli_name = client['cli_name']
-        cli_sock = client['cli_sock']
-
-        # Broadcast new client connection
-        self.broadcast(cli_name, "Welcome " + cli_name + " to the server!\n", svr_msg=True)
-
-        # TODO: integrate web interface for message sending/viewing
-        while True:
-            # Listen for messages, broadcast to all clients in the chat
-            cli_msg = cli_sock.recv(1024).decode()
-
-            # If message is /leave, remove client and close socket
-            if cli_msg.strip() == cli_name + ": /leave" or not cli_msg.strip():
-                self.broadcast(cli_name, cli_name + " has left the server.\n", svr_msg=True)
-                Server.clients.remove(client)
-                cli_sock.close()
-                break
-            else:
-                self.broadcast(cli_name, cli_msg)
-
-    def handle_register(self, args: list[str], cli_sock, app_state):
+    @staticmethod
+    def handle_register(args: list[str], cli_sock, app_state):
         if not args:
             error_resp = json.dumps({"status": "error", "code": "INVALID_USERNAME", "message": "Missing username"}) + "\n"
             cli_sock.send(error_resp.encode('utf-8'))
@@ -134,6 +114,45 @@ class Server:
     def handle_leave(self, args: list[str], cli_sock, app_state):
         # TODO: Implement LEAVE logic here
         pass
+
+    def handle_new_client(self, cli_sock, app_state):
+        COMMAND_HANDLERS = {
+            "REGISTER": self.handle_register,
+            "LOGIN": self.handle_login,
+            "JOIN": self.handle_join
+        }
+
+        while True:
+            try:
+                buffer = cli_sock.recv(1024).decode('utf-8')
+
+                # Client disconnected normally
+                if not buffer:
+                    break
+
+                lines = buffer.strip().split('\n')
+                for line in lines:
+                    if not line:
+                        continue
+
+                    parts = line.split(" ")
+                    command = parts[0].upper()
+                    args = parts[1:]  # Everything after the command
+
+                    handler_function = COMMAND_HANDLERS.get(command)
+
+                    if handler_function:
+                        handler_function(args, cli_sock, app_state)
+                    else:
+                        error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Unknown command"}) + "\n"
+                        cli_sock.send(error_resp.encode('utf-8'))
+
+            # Client crashed or force-closed
+            except ConnectionResetError:
+                break
+
+        # Cleanup
+        cli_sock.close()
 
 
 
