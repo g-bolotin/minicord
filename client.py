@@ -10,8 +10,15 @@ class Client:
         self.name = input("Enter your name: ")
         self.talk()
 
+    def register(self, username: str):
+        """Format: REGISTER <username>\n"""
+        command = f"REGISTER {username}\n"
+        self.socket.send(command.encode('utf-8'))
+        response = self.socket.recv(1024).decode('utf-8')
+        print("Server replied:", response)
+
+
     def talk(self):
-        # TODO: proper user authentication
         self.socket.send(self.name.encode())
         Thread(target=self.receive).start()
         self.send()
