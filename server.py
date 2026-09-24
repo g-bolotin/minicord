@@ -5,13 +5,27 @@ import threading
 from threading import Thread
 import re
 import json
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
 
 USERNAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 CHANNEL_PATTERN = re.compile(r'^#[a-zA-Z0-9_-]+$')
 
+HTTP_CODES = {
+    "BAD_REQUEST": 400,
+    "NOT_AUTHENTICATED": 401,
+    "NOT_FOUND": 404,
+    "CONFLICT": 409,
+    "INVALID_USERNAME": 412,
+    "INVALID_CHANNEL": 412,
+    "SERVER_ERROR": 500,
+    "CREATED": 201,
+    "SUCCESS": 200
+}
+
 class User:
     def __init__(self):
-        self.username = "" # TODO: Usernames may contain letters, digits, hyphens, and underscores. Must be unique.
+        self.username = ""  # Usernames may contain letters, digits, hyphens, and underscores. Must be unique.
         self.channels = set()
 
     @staticmethod
@@ -22,7 +36,7 @@ class User:
 
 class Channel:
     def __init__(self):
-        self.name = ""  # TODO: Channel names must begin with # and may contain letters, digits, hyphens, and underscores. Must be unique.
+        self.name = ""  # Channel names must begin with # and may contain letters, digits, hyphens, and underscores. Must be unique.
         self.messages: dict[int, Message] = {}  # MID : Message
         self.members = set()
 
@@ -58,32 +72,65 @@ class AppState:
             return current_id
 
 
-class Server:
-    # TODO: Is there a better way to broadcast to clients rather than iteratively?
-    clients: list[User] = []  # List of all clients connected to the server
+class HTTPHandler(BaseHTTPRequestHandler):
+    def __init__(self, app_state: AppState, *args, **kwargs):
+        self.app_state = app_state
+        super().__init__(*args, **kwargs)
 
-    def __init__(self, HOST, TCP_PORT):
+    def do_POST(self):
+        if self.path == "/users":
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+
+            username = data.get("username")
+
+            with self.app_state.id_lock:
+                # Username already exists
+                if username in self.app_state.users:
+                    self.send_response(HTTP_CODES.get("CONFLICT"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "code": "CONFLICT", "message": "User exists"}')
+
+                # Create new user
+                elif User.is_valid_username(username):
+                    new_user = User()
+                    new_user.username = username
+                    self.app_state.users[username] = new_user
+
+                    self.send_response(HTTP_CODES.get("CREATED"))
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+
+                    response = json.dumps({"username": username})
+                    self.wfile.write(response.encode('utf-8'))
+
+                else:
+                    self.send_response(HTTP_CODES.get("BAD_REQUEST"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "code": "BAD_REQUEST", "message": "Username contains invalid characters"}')
+
+    # TODO: Handle GET, DELETE, PUT(?) based on specs
+
+
+class Server:
+    def __init__(self, HOST, TCP_PORT, app_state: AppState):
+        self.app_state = app_state  # Store reference to shared state
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Prevents "address already in use" errors
         self.socket.bind((HOST, TCP_PORT))
-        self.socket.listen()  # can put a number here to limit max connections
-        print(f"Server is waiting for connections on {TCP_PORT}...\n")
+        self.socket.listen()
+        print(f"TCP Server is waiting for connections on {TCP_PORT}...")
 
     def listen(self):
         while True:
             cli_sock, addr = self.socket.accept()
-            print(f"Received connection from {addr}")
-
-            # Client sends name
-            # TODO: Client sends over information, server creates new user object and stores in clients
-            cli_name = cli_sock.recv(2048).decode()
-            client = {'cli_name': cli_name, 'cli_sock': cli_sock}
-
-            # TODO: Create a chatroom or join an existing chatroom
-            Server.clients.append(client)
-            Thread(target=self.handle_new_client, args=(client,)).start()
+            print(f"Received TCP connection from {addr}")
+            Thread(target=self.handle_new_client, args=(cli_sock, self.app_state)).start()
 
     @staticmethod
     def handle_register(args: list[str], cli_sock, app_state):
+        """Handle registration from TCP side."""
         if not args:
             error_resp = json.dumps({"status": "error", "code": "INVALID_USERNAME", "message": "Missing username"}) + "\n"
             cli_sock.send(error_resp.encode('utf-8'))
@@ -92,7 +139,7 @@ class Server:
         username = args[0]
         with app_state.id_lock:
             if username in app_state.users:
-                error_resp = json.dumps({"status": "error", "code": "INVALID_USERNAME", "message": "User exists"}) + "\n"
+                error_resp = json.dumps({"status": "error", "code": "CONFLICT", "message": "User exists"}) + "\n"
                 cli_sock.send(error_resp.encode('utf-8'))
 
             else:
@@ -155,21 +202,27 @@ class Server:
         cli_sock.close()
 
 
-
-    def broadcast(self, sender, message, svr_msg=False):
-        for cli in self.clients:
-            cli_sock = cli['cli_sock']
-            cli_name = cli['cli_name']
-            if cli_name != sender or svr_msg:
-                cli_sock.send(message.encode())
-
 def launch_server(HOST, PORT):
     server = Server(HOST, PORT)
     server.listen()
 
 
 if __name__ == '__main__':
-    # TODO: Parse arguments
-    t = Thread(target=launch_server, args=('127.0.0.1', 9000))
-    t.daemon = True
-    t.start()
+    if __name__ == '__main__':
+        shared_state = AppState()
+
+        # Launch TCP Server in a background thread
+        tcp_server = Server('127.0.0.1', 9000, shared_state)
+        t = Thread(target=tcp_server.listen, daemon=True)
+        t.start()
+
+        # Launch HTTP Server on the main thread
+        # Use a lambda to inject the shared_state into the HTTPHandler
+        handler = lambda *args, **kwargs: HTTPHandler(shared_state, *args, **kwargs)
+        http_server = ThreadingHTTPServer(('127.0.0.1', 8080), handler)
+
+        print("HTTP Server is waiting for connections on 8080...\n")
+        try:
+            http_server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down servers.")
