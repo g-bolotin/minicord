@@ -2,6 +2,7 @@
 # Message history need to be stored in chats that clients can pull up any time.
 import socket
 import threading
+import urllib
 from threading import Thread
 import re
 import json
@@ -79,6 +80,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_POST(self):
+        # Decode URL to convert %23 into #
+        decoded_path = urllib.parse.unquote(self.path)
+        path_parts = decoded_path.strip("/").split("/")
+
         if self.path == "/users":
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
@@ -110,6 +115,51 @@ class HTTPHandler(BaseHTTPRequestHandler):
                     self.send_response(HTTP_CODES.get("BAD_REQUEST"))
                     self.end_headers()
                     self.wfile.write(b'{"status": "error", "code": "BAD_REQUEST", "message": "Username contains invalid characters"}')
+
+        # Path format: /channels/{channel_name}/members
+        elif len(path_parts) == 3 and path_parts[0] == "channels" and path_parts[2] == "members":
+            channel_name = path_parts[1]
+            username = self.headers.get('X-User')  # Read the required authentication header
+
+            if not username:
+                self.send_response(HTTP_CODES.get("NOT_AUTHENTICATED"))
+                self.end_headers()
+                self.wfile.write(b'{"status": "error", "code": "NOT_AUTHENTICATED", "message": "Missing X-User header"}')
+                return
+
+            with self.app_state.id_lock:
+                if username not in self.app_state.users:
+                    self.send_response(HTTP_CODES.get("NOT_FOUND"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "code": "NOT_FOUND", "message": "User does not exist"}')
+                    return
+
+                if not Channel.is_valid_channel(channel_name):
+                    self.send_response(HTTP_CODES.get("BAD_REQUEST"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "code": "BAD_REQUEST", "message": "Invalid channel format"}')
+                    return
+
+                # Create channel if it doesn't exist
+                if channel_name not in self.app_state.channels:
+                    new_channel = Channel()
+                    new_channel.name = channel_name
+                    self.app_state.channels[channel_name] = new_channel
+
+                # Join channel
+                self.app_state.channels[channel_name].members.add(username)
+                self.app_state.users[username].channels.add(channel_name)
+
+                self.send_response(HTTP_CODES.get("SUCCESS"))
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+
+                response = json.dumps({
+                    "channel": channel_name,
+                    "username": username,
+                    "joined": True
+                })
+                self.wfile.write(response.encode('utf-8'))
 
     def do_GET(self):
         if self.path == "/users":
@@ -185,9 +235,41 @@ class Server:
                 success_resp = json.dumps({"status": "ok", "operation": "login", "username": username}) + "\n"
                 cli_sock.send(success_resp.encode('utf-8'))
 
-    def handle_join(self, args: list[str], cli_sock, app_state):
-        # TODO: Implement JOIN logic here
-        pass
+    @staticmethod
+    def handle_join(args: list[str], cli_sock, app_state):
+        if not args:
+            error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel name"}) + "\n"
+            cli_sock.send(error_resp.encode('utf-8'))
+            return
+
+        channel_name = args[0]
+
+        with app_state.id_lock:
+            # Identify the user
+            username = app_state.active_conns.get(cli_sock)
+            if not username:
+                error_resp = json.dumps({"status": "error", "code": "NOT_AUTHENTICATED", "message": "You must login first"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
+                return
+
+            # Validate channel format
+            if not Channel.is_valid_channel(channel_name):
+                error_resp = json.dumps({"status": "error", "code": "INVALID_CHANNEL", "message": "Invalid channel format"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
+                return
+
+            # Create channel if it does not exist
+            if channel_name not in app_state.channels:
+                new_channel = Channel()
+                new_channel.name = channel_name
+                app_state.channels[channel_name] = new_channel
+
+            # Add user to channel members
+            app_state.channels[channel_name].members.add(username)
+            app_state.users[username].channels.add(channel_name)
+
+            success_resp = json.dumps({"status": "ok", "operation": "join", "channel": channel_name}) + "\n"
+            cli_sock.send(success_resp.encode('utf-8'))
 
     def handle_leave(self, args: list[str], cli_sock, app_state):
         # TODO: Implement LEAVE logic here
@@ -248,7 +330,8 @@ class Server:
 
 
 def launch_server(HOST, PORT):
-    server = Server(HOST, PORT)
+    app_state = AppState()
+    server = Server(HOST, PORT, app_state)
     server.listen()
 
 

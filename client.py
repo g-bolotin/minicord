@@ -12,7 +12,7 @@ class Client:
             sys.exit(1)
 
         print("Connected to Minicord TCP Interface.")
-        print("Commands: REGISTER, LOGIN, QUIT")
+        print("Commands: REGISTER, LOGIN, JOIN, QUIT")
         self.command_loop()
 
     def command_loop(self):
