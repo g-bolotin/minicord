@@ -63,6 +63,7 @@ class AppState:
 
         self.users: dict[str, User] = {} # username : User
         self.channels: dict[str, Channel] = {} # channel name : Channel
+        self.active_conns: dict[socket.socket, str] = {}  # active socket : username
 
     def get_next_message_id(self):
         """Message UIDs are determined at app run and incremental."""
@@ -110,8 +111,19 @@ class HTTPHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(b'{"status": "error", "code": "BAD_REQUEST", "message": "Username contains invalid characters"}')
 
-    # TODO: Handle GET, DELETE, PUT(?) based on specs
+    def do_GET(self):
+        if self.path == "/users":
+            with self.app_state.id_lock:
+                user_list = list(self.app_state.users.keys())
 
+            self.send_response(HTTP_CODES.get("SUCCESS"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+
+            response = json.dumps({"users": user_list})
+            self.wfile.write(response.encode('utf-8'))
+
+    # TODO: Handle DELETE, PUT(?) based on specs
 
 class Server:
     def __init__(self, HOST, TCP_PORT, app_state: AppState):
@@ -126,13 +138,13 @@ class Server:
         while True:
             cli_sock, addr = self.socket.accept()
             print(f"Received TCP connection from {addr}")
-            Thread(target=self.handle_new_client, args=(cli_sock, self.app_state)).start()
+            Thread(target=self.handle_new_client, args=(cli_sock, addr, self.app_state)).start()
 
     @staticmethod
     def handle_register(args: list[str], cli_sock, app_state):
         """Handle registration from TCP side."""
         if not args:
-            error_resp = json.dumps({"status": "error", "code": "INVALID_USERNAME", "message": "Missing username"}) + "\n"
+            error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing username"}) + "\n"
             cli_sock.send(error_resp.encode('utf-8'))
             return
 
@@ -150,9 +162,28 @@ class Server:
                 success_resp = json.dumps({"status": "ok", "operation": "register", "username": username}) + "\n"
                 cli_sock.send(success_resp.encode('utf-8'))
 
-    def handle_login(self, args: list[str], cli_sock, app_state):
-        # TODO: Implement LOGIN logic here
-        pass
+    @staticmethod
+    def handle_login(args: list[str], cli_sock, app_state):
+        """Handle login from TCP side."""
+        if not args:
+            error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing username"}) + "\n"
+            cli_sock.send(error_resp.encode('utf-8'))
+            return
+
+        username = args[0]
+
+        with app_state.id_lock:
+            if username not in app_state.users:
+                error_resp = json.dumps(
+                    {"status": "error", "code": "NOT_FOUND", "message": "User does not exist"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
+            else:
+                # Bind the socket to the user
+                app_state.active_conns[cli_sock] = username
+
+                # Basic login, no security since that's out of scope
+                success_resp = json.dumps({"status": "ok", "operation": "login", "username": username}) + "\n"
+                cli_sock.send(success_resp.encode('utf-8'))
 
     def handle_join(self, args: list[str], cli_sock, app_state):
         # TODO: Implement JOIN logic here
@@ -162,7 +193,7 @@ class Server:
         # TODO: Implement LEAVE logic here
         pass
 
-    def handle_new_client(self, cli_sock, app_state):
+    def handle_new_client(self, cli_sock, addr, app_state):
         COMMAND_HANDLERS = {
             "REGISTER": self.handle_register,
             "LOGIN": self.handle_login,
@@ -199,7 +230,21 @@ class Server:
                 break
 
         # Cleanup
+        dc_user = None
+
+        with app_state.id_lock:
+            if cli_sock in app_state.active_conns:
+                # Remove them from the active connections map and remember who they were
+                dc_user = app_state.active_conns.pop(cli_sock)
+
+            # TODO: Iterate through app_state.channels and remove disconnected_user from channel.members
+
         cli_sock.close()
+
+        if dc_user:
+            print(f"User '{dc_user}' disconnected {addr}.")
+        else:
+            print(f"Unauthenticated client disconnected from {addr}.")
 
 
 def launch_server(HOST, PORT):
