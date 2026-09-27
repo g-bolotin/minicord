@@ -173,6 +173,17 @@ class HTTPHandler(BaseHTTPRequestHandler):
             response = json.dumps({"users": user_list})
             self.wfile.write(response.encode('utf-8'))
 
+        elif self.path == "/channels":
+            with self.app_state.id_lock:
+                channel_list = list(self.app_state.channels.keys())
+
+            self.send_response(HTTP_CODES.get("SUCCESS"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+
+            response = json.dumps({"channels": channel_list})
+            self.wfile.write(response.encode('utf-8'))
+
     # TODO: Handle DELETE, PUT(?) based on specs
 
 class Server:
