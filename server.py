@@ -191,7 +191,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(response.encode('utf-8'))
 
         # GET channel members
-        # Match path format: /channels/{channel_name}/users
+        # Path format: /channels/{channel_name}/users
         elif len(path_parts) == 3 and path_parts[0] == "channels" and path_parts[2] == "users":
             channel_name = path_parts[1]
 
@@ -221,7 +221,50 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"status": "error", "message": "Endpoint not found"}')
 
-    # TODO: Handle DELETE, PUT(?) based on specs
+    def do_DELETE(self):
+        # %23 to #
+        decoded_path = urllib.parse.unquote(self.path)
+        path_parts = decoded_path.strip("/").split("/")
+
+        # Path format: /channels/{channel_name}/members/{username}
+        if len(path_parts) == 4 and path_parts[0] == "channels" and path_parts[2] == "members":
+            channel_name = path_parts[1]
+            username = path_parts[3]
+
+            with self.app_state.id_lock:
+                # Validate that user and channel exists
+                if channel_name not in self.app_state.channels:
+                    self.send_response(HTTP_CODES.get("NOT_FOUND"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}')
+                    return
+
+                if username not in self.app_state.users:
+                    self.send_response(HTTP_CODES.get("NOT_FOUND"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "code": "NOT_FOUND", "message": "User does not exist"}')
+                    return
+
+                # Remove user from channel
+                self.app_state.channels[channel_name].members.discard(username)
+                self.app_state.users[username].channels.discard(channel_name)
+
+            self.send_response(HTTP_CODES.get("SUCCESS"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+
+            response = json.dumps({
+                "channel": channel_name,
+                "username": username,
+                "left": True
+            })
+            self.wfile.write(response.encode('utf-8'))
+
+        else:
+            self.send_response(HTTP_CODES.get("NOT_FOUND"))
+            self.end_headers()
+            self.wfile.write(b'{"status": "error", "message": "Endpoint not found"}')
+
 
 class Server:
     def __init__(self, HOST, TCP_PORT, app_state: AppState):
@@ -319,9 +362,48 @@ class Server:
             success_resp = json.dumps({"status": "ok", "operation": "join", "channel": channel_name}) + "\n"
             cli_sock.send(success_resp.encode('utf-8'))
 
-    def handle_leave(self, args: list[str], cli_sock, app_state):
-        # TODO: Implement LEAVE logic here
-        pass
+    @staticmethod
+    def handle_leave(args: list[str], cli_sock, app_state):
+        if not args:
+            error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel name"}) + "\n"
+            cli_sock.send(error_resp.encode('utf-8'))
+            return
+
+        channel_name = args[0]
+
+        with app_state.id_lock:
+            # Check if user is logged in
+            username = app_state.active_conns.get(cli_sock)
+            if not username:
+                error_resp = json.dumps({"status": "error", "code": "NOT_AUTHENTICATED", "message": "You must login first"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
+                return
+
+            # Check if channel exists
+            if channel_name not in app_state.channels:
+                error_resp = json.dumps({"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
+                return
+
+            # Remove the user from the channel
+            # discard() instead of remove() to avoid crashing if the user wasn't in the set
+            app_state.channels[channel_name].members.discard(username)
+            app_state.users[username].channels.discard(channel_name)
+
+            success_resp = json.dumps({"status": "ok", "operation": "leave", "channel": channel_name}) + "\n"
+            cli_sock.send(success_resp.encode('utf-8'))
+
+    @staticmethod
+    def handle_logout(args: list[str], cli_sock, app_state):
+        with app_state.id_lock:
+            # Check if user is actually logged in
+            if cli_sock in app_state.active_conns:
+                username = app_state.active_conns.pop(cli_sock)
+                success_resp = json.dumps({"status": "ok", "operation": "logout", "username": username}) + "\n"
+                cli_sock.send(success_resp.encode('utf-8'))
+            else:
+                error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Not logged in"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
 
     @staticmethod
     def handle_list(args: list[str], cli_sock, app_state):
@@ -373,7 +455,9 @@ class Server:
             "REGISTER": self.handle_register,
             "LOGIN": self.handle_login,
             "JOIN": self.handle_join,
-            "LIST": self.handle_list
+            "LIST": self.handle_list,
+            "LEAVE": self.handle_leave,
+            "LOGOUT": self.handle_logout
         }
 
         while True:
