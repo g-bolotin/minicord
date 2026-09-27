@@ -12,7 +12,16 @@ class Client:
             sys.exit(1)
 
         print("Connected to Minicord TCP Interface.")
-        print("Commands: REGISTER, LOGIN, JOIN, QUIT")
+        print("---- Commands ----")
+        print("REGISTER <name> - Create user\n"
+              "LOGIN <name> - login with existing user\n"
+              "JOIN <channel_name> - join channel, must prefix name with #\n"
+              "SEND <channel> <message> - send message to specified channel\n"
+              "HISTORY <channel> [limit] - show message history, optional limit num messages\n"
+              "LIST [users <channel> | channels] - list all users belonging to a channel, or list all channels \n"
+              "LEAVE <channel> - leave channel\n"
+              "LOGOUT - log out from current user\n"
+              "QUIT - stop client\n")
         self.command_loop()
 
     def command_loop(self):

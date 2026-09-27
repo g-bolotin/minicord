@@ -49,21 +49,29 @@ class Channel:
 
 class Message:
     def __init__(self):
-        self.mid = 0
-        self.channel_name = ""
+        self.message_id = 0
+        self.channel = ""
         self.username = ""
-        self.content = ""
-        self.timestamp = 0
+        self.text = ""
+
+    def to_dict(self):
+        """For serializing the message to JSON."""
+        return {
+            "message_id": self.message_id,
+            "channel": self.channel,
+            "username": self.username,
+            "text": self.text
+        }
 
 
 class AppState:
     """Maintains local application state rather than external database."""
     def __init__(self):
         self._message_id_counter = 1
-        self.id_lock = threading.Lock()
+        self.id_lock = threading.RLock()  # Allows same thread to reacquire lock safely
 
-        self.users: dict[str, User] = {} # username : User
-        self.channels: dict[str, Channel] = {} # channel name : Channel
+        self.users: dict[str, User] = {}  # username : User
+        self.channels: dict[str, Channel] = {}  # channel name : Channel
         self.active_conns: dict[socket.socket, str] = {}  # active socket : username
 
     def get_next_message_id(self):
@@ -84,6 +92,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         decoded_path = urllib.parse.unquote(self.path)
         path_parts = decoded_path.strip("/").split("/")
 
+        # POST user
         if self.path == "/users":
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
@@ -116,6 +125,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(b'{"status": "error", "code": "BAD_REQUEST", "message": "Username contains invalid characters"}')
 
+        # POST channel member
         # Path format: /channels/{channel_name}/members
         elif len(path_parts) == 3 and path_parts[0] == "channels" and path_parts[2] == "members":
             channel_name = path_parts[1]
@@ -161,10 +171,57 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 })
                 self.wfile.write(response.encode('utf-8'))
 
+        # POST Message
+        # Path format: /channels/{channel_name}/messages
+        elif len(path_parts) == 3 and path_parts[0] == "channels" and path_parts[2] == "messages":
+            channel_name = path_parts[1]
+            username = self.headers.get('X-User')
+
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            text = data.get("text")
+
+            if not username or not text:
+                self.send_response(HTTP_CODES.get("BAD_REQUEST"))
+                self.end_headers()
+                self.wfile.write(b'{"status": "error", "message": "Missing header or text"}')
+                return
+
+            with self.app_state.id_lock:
+                if channel_name not in self.app_state.channels:
+                    self.send_response(HTTP_CODES.get("NOT_FOUND"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "message": "Channel not found"}')
+                    return
+
+                if username not in self.app_state.channels[channel_name].members:
+                    self.send_response(HTTP_CODES.get("BAD_REQUEST"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "message": "Not in channel"}')
+                    return
+
+                msg = Message()
+                msg.message_id = self.app_state.get_next_message_id()
+                msg.channel = channel_name
+                msg.username = username
+                msg.text = text
+
+                self.app_state.channels[channel_name].messages[msg.message_id] = msg
+
+            self.send_response(HTTP_CODES.get("CREATED"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(msg.to_dict()).encode('utf-8'))
+
     def do_GET(self):
+        # Separate query params
+        parsed_url = urllib.parse.urlparse(self.path)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+
         # %23 to #
-        decoded_path = urllib.parse.unquote(self.path)
-        path_parts = decoded_path.strip("/").split("/")
+        decoded_path = urllib.parse.unquote(parsed_url.path)
+        path_parts = [p for p in decoded_path.strip("/").split("/") if p]
 
         # GET users
         if self.path == "/users":
@@ -213,6 +270,33 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 "channel": channel_name,
                 "users": member_list
             })
+            self.wfile.write(response.encode('utf-8'))
+
+        # GET Messages
+        # Path format: /channels/{channel_name}/messages
+        elif len(path_parts) == 3 and path_parts[0] == "channels" and path_parts[2] == "messages":
+            channel_name = path_parts[1]
+
+            # parse_qs returns lists for values, so we extract the first item if it exists
+            limit = query_params.get("limit", [None])[0]
+
+            with self.app_state.id_lock:
+                if channel_name not in self.app_state.channels:
+                    self.send_response(HTTP_CODES.get("NOT_FOUND"))
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "message": "Channel not found"}')
+                    return
+
+                all_messages = [msg.to_dict() for msg in self.app_state.channels[channel_name].messages.values()]
+
+                if limit and limit.isdigit():
+                    all_messages = all_messages[-int(limit):]
+
+            self.send_response(HTTP_CODES.get("SUCCESS"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+
+            response = json.dumps({"channel": channel_name, "messages": all_messages})
             self.wfile.write(response.encode('utf-8'))
 
         # Unknown command
@@ -450,6 +534,74 @@ class Server:
                 {"status": "error", "code": "BAD_REQUEST", "message": "Unknown LIST command"}) + "\n"
             cli_sock.send(error_resp.encode('utf-8'))
 
+    @staticmethod
+    def handle_send(args: list[str], cli_sock, app_state):
+        if len(args) < 2:
+            error_resp = json.dumps(
+                {"status": "error", "code": "BAD_REQUEST", "message": "Missing channel or text"}) + "\n"
+            cli_sock.send(error_resp.encode('utf-8'))
+            return
+
+        channel_name = args[0]
+        # SEND splits incoming string with " ", need to reconstruct full message
+        text = " ".join(args[1:])
+
+        with app_state.id_lock:
+            username = app_state.active_conns.get(cli_sock)
+            if not username:
+                cli_sock.send(
+                    json.dumps({"status": "error", "code": "NOT_AUTHENTICATED", "message": "Not logged in"}) + "\n")
+                return
+
+            if channel_name not in app_state.channels:
+                cli_sock.send(
+                    json.dumps({"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n")
+                return
+
+            if username not in app_state.channels[channel_name].members:
+                cli_sock.send(json.dumps(
+                    {"status": "error", "code": "BAD_REQUEST", "message": "You must join the channel first"}) + "\n")
+                return
+
+            # Create and store the message
+            msg = Message()
+            msg.message_id = app_state.get_next_message_id()
+            msg.channel = channel_name
+            msg.username = username
+            msg.text = text
+
+            app_state.channels[channel_name].messages[msg.message_id] = msg
+
+            success_resp = json.dumps({"status": "ok", "operation": "send", "message_id": msg.message_id}) + "\n"
+            cli_sock.send(success_resp.encode('utf-8'))
+
+    @staticmethod
+    def handle_history(args: list[str], cli_sock, app_state):
+        if not args:
+            cli_sock.send(json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel"}) + "\n")
+            return
+
+        channel_name = args[0]
+        limit = None
+        if len(args) > 1 and args[1].isdigit():
+            limit = int(args[1])
+
+        with app_state.id_lock:
+            if channel_name not in app_state.channels:
+                cli_sock.send(
+                    json.dumps({"status": "error", "code": "NOT_FOUND", "message": "Channel not found"}) + "\n")
+                return
+
+            # Get all messages as a list of dictionaries
+            all_messages = [msg.to_dict() for msg in app_state.channels[channel_name].messages.values()]
+
+            # Apply limit (ex. last 20 messages)
+            if limit:
+                all_messages = all_messages[-limit:]
+
+            success_resp = json.dumps({"status": "ok", "channel": channel_name, "messages": all_messages}) + "\n"
+            cli_sock.send(success_resp.encode('utf-8'))
+
     def handle_new_client(self, cli_sock, addr, app_state):
         COMMAND_HANDLERS = {
             "REGISTER": self.handle_register,
@@ -457,7 +609,9 @@ class Server:
             "JOIN": self.handle_join,
             "LIST": self.handle_list,
             "LEAVE": self.handle_leave,
-            "LOGOUT": self.handle_logout
+            "LOGOUT": self.handle_logout,
+            "SEND": self.handle_send,
+            "HISTORY": self.handle_history
         }
 
         while True:
