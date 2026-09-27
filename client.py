@@ -1,3 +1,7 @@
+# Galit Bolotin (galit.bolotin@sjsu.edu)
+# CS249
+# Last edited: 9/27/26
+
 import socket
 import sys
 

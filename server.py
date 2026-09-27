@@ -1,5 +1,7 @@
-# Server listens to all clients. A client sends a message, and this message is broadcast to all other clients.
-# Message history need to be stored in chats that clients can pull up any time.
+# Galit Bolotin (galit.bolotin@sjsu.edu)
+# CS249
+# Last edited: 9/27/26
+
 import socket
 import threading
 import urllib
@@ -8,6 +10,7 @@ import re
 import json
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
+import argparse
 
 USERNAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 CHANNEL_PATTERN = re.compile(r'^#[a-zA-Z0-9_-]+$')
@@ -223,8 +226,14 @@ class HTTPHandler(BaseHTTPRequestHandler):
         decoded_path = urllib.parse.unquote(parsed_url.path)
         path_parts = [p for p in decoded_path.strip("/").split("/") if p]
 
+        if decoded_path == "/health":
+            self.send_response(HTTP_CODES.get("SUCCESS"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+
         # GET users
-        if self.path == "/users":
+        elif decoded_path == "/users":
             with self.app_state.id_lock:
                 user_list = list(self.app_state.users.keys())
 
@@ -236,7 +245,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(response.encode('utf-8'))
 
         # GET channels
-        elif self.path == "/channels":
+        elif decoded_path == "/channels":
             with self.app_state.id_lock:
                 channel_list = list(self.app_state.channels.keys())
 
@@ -668,21 +677,26 @@ def launch_server(HOST, PORT):
 
 
 if __name__ == '__main__':
-    if __name__ == '__main__':
-        shared_state = AppState()
+    parser = argparse.ArgumentParser(description="Mini Discord Server")
+    parser.add_argument('--host', type=str, required=True, help="Host IP address")
+    parser.add_argument('--tcp-port', type=int, required=True, help="TCP port number")
+    parser.add_argument('--http-port', type=int, required=True, help="HTTP port number")
 
-        # Launch TCP Server in a background thread
-        tcp_server = Server('127.0.0.1', 9000, shared_state)
-        t = Thread(target=tcp_server.listen, daemon=True)
-        t.start()
+    args = parser.parse_args()
+    shared_state = AppState()
 
-        # Launch HTTP Server on the main thread
-        # Use a lambda to inject the shared_state into the HTTPHandler
-        handler = lambda *args, **kwargs: HTTPHandler(shared_state, *args, **kwargs)
-        http_server = ThreadingHTTPServer(('127.0.0.1', 8080), handler)
+    # Launch TCP Server in a background thread
+    tcp_server = Server(args.host, args.tcp_port, shared_state)
+    t = Thread(target=tcp_server.listen, daemon=True)
+    t.start()
 
-        print("HTTP Server is waiting for connections on 8080...\n")
-        try:
-            http_server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down servers.")
+    # Launch HTTP Server on the main thread
+    # Use a lambda to inject the shared_state into the HTTPHandler
+    handler = lambda *a, **kwargs: HTTPHandler(shared_state, *a, **kwargs)
+    http_server = ThreadingHTTPServer((args.host, args.http_port), handler)
+
+    print(f"HTTP Server is waiting for connections on {args.http_port}...\n")
+    try:
+        http_server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down servers.")
