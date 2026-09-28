@@ -4,6 +4,7 @@
 
 import socket
 import sys
+import argparse
 
 
 class Client:
@@ -58,4 +59,9 @@ class Client:
 
 
 if __name__ == '__main__':
-    Client('127.0.0.1', 9000)
+    parser = argparse.ArgumentParser(description="Mini Discord TCP Client")
+    parser.add_argument('--host', type=str, default='127.0.0.1', help="Server IP address")
+    parser.add_argument('--port', type=int, default=9000, help="Server TCP port")
+
+    args = parser.parse_args()
+    Client(args.host, args.port)

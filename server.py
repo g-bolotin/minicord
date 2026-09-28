@@ -678,9 +678,9 @@ def launch_server(HOST, PORT):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Mini Discord Server")
-    parser.add_argument('--host', type=str, required=True, help="Host IP address")
-    parser.add_argument('--tcp-port', type=int, required=True, help="TCP port number")
-    parser.add_argument('--http-port', type=int, required=True, help="HTTP port number")
+    parser.add_argument('--host', type=str, default='127.0.0.1', help="Host IP address")
+    parser.add_argument('--tcp-port', type=int, default='9000', help="TCP port number")
+    parser.add_argument('--http-port', type=int, default='8080', help="HTTP port number")
 
     args = parser.parse_args()
     shared_state = AppState()
