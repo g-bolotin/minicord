@@ -558,18 +558,21 @@ class Server:
         with app_state.id_lock:
             username = app_state.active_conns.get(cli_sock)
             if not username:
-                cli_sock.send(
-                    json.dumps({"status": "error", "code": "NOT_AUTHENTICATED", "message": "Not logged in"}) + "\n")
+                error_resp = json.dumps(
+                    {"status": "error", "code": "NOT_AUTHENTICATED", "message": "Not logged in"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
                 return
 
             if channel_name not in app_state.channels:
-                cli_sock.send(
-                    json.dumps({"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n")
+                error_resp = json.dumps(
+                    {"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
                 return
 
             if username not in app_state.channels[channel_name].members:
-                cli_sock.send(json.dumps(
-                    {"status": "error", "code": "BAD_REQUEST", "message": "You must join the channel first"}) + "\n")
+                error_resp = json.dumps(
+                    {"status": "error", "code": "BAD_REQUEST", "message": "You must join the channel first"}) + "\n"
+                cli_sock.send(error_resp.encode('utf-8'))
                 return
 
             # Create and store the message
@@ -657,10 +660,14 @@ class Server:
 
         with app_state.id_lock:
             if cli_sock in app_state.active_conns:
-                # Remove them from the active connections map and remember who they were
+                # Remove them from the active connections map
                 dc_user = app_state.active_conns.pop(cli_sock)
 
-            # TODO: Iterate through app_state.channels and remove disconnected_user from channel.members
+            # Remove from all channels and user list
+            if dc_user:
+                for channel in app_state.channels.values():
+                    channel.members.discard(dc_user)
+                app_state.users.pop(dc_user, None)
 
         cli_sock.close()
 
