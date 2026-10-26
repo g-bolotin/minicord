@@ -109,13 +109,6 @@ class AppState:
         for name, primary, backup in default_channels:
             self.channels[name] = Channel(name=name, primary=primary, backup=backup)
 
-    # def get_next_message_id(self):
-    #     """Message UIDs are determined at app run and incremental."""
-    #     with self.id_lock:
-    #         current_id = self._message_id_counter
-    #         self._message_id_counter += 1
-    #         return current_id
-
 
 class HTTPHandler(BaseHTTPRequestHandler):
     def __init__(self, app_state: AppState, *args, **kwargs):
@@ -418,322 +411,448 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"status": "error", "message": "Endpoint not found"}')
 
 
+def send_peer_message(app_state: AppState, target_id: str, payload: dict, timeout: float = 2.0, expect_response: bool = True) -> dict | None:
+    """Sends a newline-terminated JSON message to a peer server over TCP."""
+    target_cfg = app_state.servers_config.get(target_id)
+    if not target_cfg:
+        return None
+
+    host = target_cfg["host"]
+    port = target_cfg["peer_port"]
+
+    try:
+        # Open socket and attempt to send payload
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((host, port))
+            msg_bytes = (json.dumps(payload) + "\n").encode('utf-8')
+            sock.sendall(msg_bytes)
+
+            if not expect_response:
+                return {"status": "sent"}
+
+            # Read until newline
+            buffer = ""
+            while "\n" not in buffer:
+                chunk = sock.recv(4096).decode('utf-8')
+                if not chunk:
+                    break
+                buffer += chunk
+
+            line = buffer.strip()
+            if not line:
+                return None
+            return json.loads(line.split("\n")[0])
+
+    except (socket.timeout, ConnectionError, OSError, json.JSONDecodeError):
+        return None
+
+
 class Server:
     def __init__(self, HOST, TCP_PORT, app_state: AppState):
-        self.app_state = app_state  # Store reference to shared state
+        self.app_state = app_state
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Prevents "address already in use" errors
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind((HOST, TCP_PORT))
         self.socket.listen()
-        print(f"TCP Server is waiting for connections on {TCP_PORT}...")
 
     def listen(self):
         while True:
             cli_sock, addr = self.socket.accept()
-            print(f"Received TCP connection from {addr}")
-            Thread(target=self.handle_new_client, args=(cli_sock, addr, self.app_state)).start()
+            Thread(target=self.handle_peer_connection, args=(cli_sock, addr, self.app_state), daemon=True).start()
 
     @staticmethod
-    def handle_register(args: list[str], cli_sock, app_state):
-        """Handle registration from TCP side."""
-        if not args:
-            error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing username"}) + "\n"
-            cli_sock.send(error_resp.encode('utf-8'))
-            return
-
-        username = args[0]
-        with app_state.id_lock:
-            if username in app_state.users:
-                error_resp = json.dumps({"status": "error", "code": "CONFLICT", "message": "User exists"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-
-            else:
-                new_user = User()
-                new_user.username = username
-                app_state.users[username] = new_user
-
-                success_resp = json.dumps({"status": "ok", "operation": "register", "username": username}) + "\n"
-                cli_sock.send(success_resp.encode('utf-8'))
+    def handle_ping(msg: dict, cli_sock: socket.socket, app_state: AppState):
+        """Handles incoming heartbeat PING and replies with PONG matching sequence."""
+        seq = msg.get("sequence", 1)
+        pong_resp = {
+            "type": "PONG",
+            "from": app_state.server_id,
+            "sequence": seq
+        }
+        cli_sock.sendall((json.dumps(pong_resp) + "\n").encode('utf-8'))
 
     @staticmethod
-    def handle_login(args: list[str], cli_sock, app_state):
-        """Handle login from TCP side."""
-        if not args:
-            error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing username"}) + "\n"
-            cli_sock.send(error_resp.encode('utf-8'))
-            return
-
-        username = args[0]
-
-        with app_state.id_lock:
-            if username not in app_state.users:
-                error_resp = json.dumps(
-                    {"status": "error", "code": "NOT_FOUND", "message": "User does not exist"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-            else:
-                # Bind the socket to the user
-                app_state.active_conns[cli_sock] = username
-
-                # Basic login, no security since that's out of scope
-                success_resp = json.dumps({"status": "ok", "operation": "login", "username": username}) + "\n"
-                cli_sock.send(success_resp.encode('utf-8'))
-
-    @staticmethod
-    def handle_join(args: list[str], cli_sock, app_state):
-        if not args:
-            error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel name"}) + "\n"
-            cli_sock.send(error_resp.encode('utf-8'))
-            return
-
-        channel_name = args[0]
-
-        with app_state.id_lock:
-            # Identify the user
-            username = app_state.active_conns.get(cli_sock)
-            if not username:
-                error_resp = json.dumps({"status": "error", "code": "NOT_AUTHENTICATED", "message": "You must login first"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-                return
-
-            # Validate channel format
-            if not Channel.is_valid_channel(channel_name):
-                error_resp = json.dumps({"status": "error", "code": "INVALID_CHANNEL", "message": "Invalid channel format"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-                return
-
-            # Create channel if it does not exist
-            if channel_name not in app_state.channels:
-                new_channel = Channel()
-                new_channel.name = channel_name
-                app_state.channels[channel_name] = new_channel
-
-            # Add user to channel members
-            app_state.channels[channel_name].members.add(username)
-            app_state.users[username].channels.add(channel_name)
-
-            success_resp = json.dumps({"status": "ok", "operation": "join", "channel": channel_name}) + "\n"
-            cli_sock.send(success_resp.encode('utf-8'))
-
-    @staticmethod
-    def handle_leave(args: list[str], cli_sock, app_state):
-        if not args:
-            error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel name"}) + "\n"
-            cli_sock.send(error_resp.encode('utf-8'))
-            return
-
-        channel_name = args[0]
-
-        with app_state.id_lock:
-            # Check if user is logged in
-            username = app_state.active_conns.get(cli_sock)
-            if not username:
-                error_resp = json.dumps({"status": "error", "code": "NOT_AUTHENTICATED", "message": "You must login first"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-                return
-
-            # Check if channel exists
-            if channel_name not in app_state.channels:
-                error_resp = json.dumps({"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-                return
-
-            # Remove the user from the channel
-            # discard() instead of remove() to avoid crashing if the user wasn't in the set
-            app_state.channels[channel_name].members.discard(username)
-            app_state.users[username].channels.discard(channel_name)
-
-            success_resp = json.dumps({"status": "ok", "operation": "leave", "channel": channel_name}) + "\n"
-            cli_sock.send(success_resp.encode('utf-8'))
-
-    @staticmethod
-    def handle_logout(args: list[str], cli_sock, app_state):
-        with app_state.id_lock:
-            # Check if user is actually logged in
-            if cli_sock in app_state.active_conns:
-                username = app_state.active_conns.pop(cli_sock)
-                success_resp = json.dumps({"status": "ok", "operation": "logout", "username": username}) + "\n"
-                cli_sock.send(success_resp.encode('utf-8'))
-            else:
-                error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Not logged in"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-
-    @staticmethod
-    def handle_list(args: list[str], cli_sock, app_state):
-        if not args:
-            error_resp = json.dumps(
-                {"status": "error", "code": "BAD_REQUEST", "message": "Missing LIST arguments"}) + "\n"
-            cli_sock.send(error_resp.encode('utf-8'))
-            return
-
-        sub_command = args[0].upper()
-
-        # LIST CHANNELS
-        if sub_command == "CHANNELS":
+    def handle_leader_announce(msg: dict, cli_sock: socket.socket, app_state: AppState):
+        """Updates local leader state when a new leader announces itself."""
+        new_leader = msg.get("leader")
+        if new_leader:
             with app_state.id_lock:
-                channel_list = list(app_state.channels.keys())
-
-            success_resp = json.dumps({"status": "ok", "channels": channel_list}) + "\n"
-            cli_sock.send(success_resp.encode('utf-8'))
-
-        # LIST USERS
-        elif sub_command == "USERS":
-            if len(args) < 2:
-                error_resp = json.dumps(
-                    {"status": "error", "code": "BAD_REQUEST", "message": "Missing channel name"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-                return
-
-            channel_name = args[1]
-            with app_state.id_lock:
-                if channel_name not in app_state.channels:
-                    error_resp = json.dumps(
-                        {"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n"
-                    cli_sock.send(error_resp.encode('utf-8'))
-                    return
-
-                # Sets are not JSON serializable, convert to a list
-                member_list = list(app_state.channels[channel_name].members)
-
-            success_resp = json.dumps({"status": "ok", "channel": channel_name, "users": member_list}) + "\n"
-            cli_sock.send(success_resp.encode('utf-8'))
-
-        else:
-            error_resp = json.dumps(
-                {"status": "error", "code": "BAD_REQUEST", "message": "Unknown LIST command"}) + "\n"
-            cli_sock.send(error_resp.encode('utf-8'))
+                app_state.current_leader = new_leader
+                app_state.peer_alive[new_leader] = True
+            print(f"[Server {app_state.server_id}] Received LEADER_ANNOUNCE: new cluster leader is Server {new_leader}",
+                  flush=True)
+        ack = {"type": "LEADER_ANNOUNCE_ACK", "from": app_state.server_id}
+        cli_sock.sendall((json.dumps(ack) + "\n").encode('utf-8'))
 
     @staticmethod
-    def handle_send(args: list[str], cli_sock, app_state):
-        if len(args) < 2:
-            error_resp = json.dumps(
-                {"status": "error", "code": "BAD_REQUEST", "message": "Missing channel or text"}) + "\n"
-            cli_sock.send(error_resp.encode('utf-8'))
-            return
-
-        channel_name = args[0]
-        # SEND splits incoming string with " ", need to reconstruct full message
-        text = " ".join(args[1:])
-
-        with app_state.id_lock:
-            username = app_state.active_conns.get(cli_sock)
-            if not username:
-                error_resp = json.dumps(
-                    {"status": "error", "code": "NOT_AUTHENTICATED", "message": "Not logged in"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-                return
-
-            if channel_name not in app_state.channels:
-                error_resp = json.dumps(
-                    {"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-                return
-
-            if username not in app_state.channels[channel_name].members:
-                error_resp = json.dumps(
-                    {"status": "error", "code": "BAD_REQUEST", "message": "You must join the channel first"}) + "\n"
-                cli_sock.send(error_resp.encode('utf-8'))
-                return
-
-            # Create and store the message
-            msg = Message()
-            msg.message_id = app_state.get_next_message_id()
-            msg.channel = channel_name
-            msg.username = username
-            msg.text = text
-
-            app_state.channels[channel_name].messages[msg.message_id] = msg
-
-            success_resp = json.dumps({"status": "ok", "operation": "send", "message_id": msg.message_id}) + "\n"
-            cli_sock.send(success_resp.encode('utf-8'))
+    def handle_replicate(msg: dict, cli_sock: socket.socket, app_state: AppState):
+        """Backup message replication"""
+        # TODO: backup message replication
+        pass
 
     @staticmethod
-    def handle_history(args: list[str], cli_sock, app_state):
-        if not args:
-            cli_sock.send(json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel"}) + "\n")
-            return
+    def handle_forward(msg: dict, cli_sock: socket.socket, app_state: AppState):
+        """Primary request forwarding"""
+        # TODO: primary request forwarding
+        pass
 
-        channel_name = args[0]
-        limit = None
-        if len(args) > 1 and args[1].isdigit():
-            limit = int(args[1])
+    @staticmethod
+    def handle_user_sync(msg: dict, cli_sock: socket.socket, app_state: AppState):
+        """Global user registration & replication"""
+        # TODO: global user registration and replication
+        pass
 
-        with app_state.id_lock:
-            if channel_name not in app_state.channels:
-                cli_sock.send(
-                    json.dumps({"status": "error", "code": "NOT_FOUND", "message": "Channel not found"}) + "\n")
-                return
-
-            # Get all messages as a list of dictionaries
-            all_messages = [msg.to_dict() for msg in app_state.channels[channel_name].messages.values()]
-
-            # Apply limit (ex. last 20 messages)
-            if limit:
-                all_messages = all_messages[-limit:]
-
-            success_resp = json.dumps({"status": "ok", "channel": channel_name, "messages": all_messages}) + "\n"
-            cli_sock.send(success_resp.encode('utf-8'))
-
-    def handle_new_client(self, cli_sock, addr, app_state):
-        COMMAND_HANDLERS = {
-            "REGISTER": self.handle_register,
-            "LOGIN": self.handle_login,
-            "JOIN": self.handle_join,
-            "LIST": self.handle_list,
-            "LEAVE": self.handle_leave,
-            "LOGOUT": self.handle_logout,
-            "SEND": self.handle_send,
-            "HISTORY": self.handle_history
+    def handle_peer_connection(self, cli_sock: socket.socket, addr, app_state: AppState):
+        PEER_HANDLERS = {
+            "PING": self.handle_ping,
+            "LEADER_ANNOUNCE": self.handle_leader_announce,
+            "REPLICATE": self.handle_replicate,
+            "FORWARD": self.handle_forward,
+            "USER_SYNC": self.handle_user_sync
         }
 
-        while True:
-            try:
-                buffer = cli_sock.recv(1024).decode('utf-8')
-
-                # Client disconnected normally
-                if not buffer:
+        buffer = ""
+        try:
+            while True:
+                # Receive json message bytes
+                chunk = cli_sock.recv(4096).decode('utf-8')
+                if not chunk:
                     break
+                buffer += chunk
 
-                lines = buffer.strip().split('\n')
-                for line in lines:
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
                     if not line:
                         continue
 
-                    parts = line.split(" ")
-                    command = parts[0].upper()
-                    args = parts[1:]  # Everything after the command
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        err = {"status": "error", "code": "INVALID_JSON", "message": "Invalid peer JSON"}
+                        cli_sock.sendall((json.dumps(err) + "\n").encode('utf-8'))
+                        continue
 
-                    handler_function = COMMAND_HANDLERS.get(command)
-
-                    if handler_function:
-                        handler_function(args, cli_sock, app_state)
+                    # Based on received message type, send to appropriate handler
+                    msg_type = msg.get("type")
+                    handler_fn = PEER_HANDLERS.get(msg_type)
+                    if handler_fn:
+                        handler_fn(msg, cli_sock, app_state)
                     else:
-                        error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Unknown command"}) + "\n"
-                        cli_sock.send(error_resp.encode('utf-8'))
+                        err = {"status": "error", "code": "UNKNOWN_TYPE",
+                               "message": f"Unknown peer message type: {msg_type}"}
+                        cli_sock.sendall((json.dumps(err) + "\n").encode('utf-8'))
 
-            # Client crashed or force-closed
-            except ConnectionResetError:
-                break
+        # Client crashed or force-closed
+        except (ConnectionError, OSError):
+            pass
 
         # Cleanup
-        dc_user = None
+        finally:
+            cli_sock.close()
 
-        with app_state.id_lock:
-            if cli_sock in app_state.active_conns:
-                # Remove them from the active connections map
-                dc_user = app_state.active_conns.pop(cli_sock)
-
-            # Remove from all channels and user list
-            if dc_user:
-                for channel in app_state.channels.values():
-                    channel.members.discard(dc_user)
-                app_state.users.pop(dc_user, None)
-
-        cli_sock.close()
-
-        if dc_user:
-            print(f"User '{dc_user}' disconnected {addr}.")
-        else:
-            print(f"Unauthenticated client disconnected from {addr}.")
+    # @staticmethod
+    # def handle_register(args: list[str], cli_sock, app_state):
+    #     """Handle registration from TCP side."""
+    #     if not args:
+    #         error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing username"}) + "\n"
+    #         cli_sock.send(error_resp.encode('utf-8'))
+    #         return
+    #
+    #     username = args[0]
+    #     with app_state.id_lock:
+    #         if username in app_state.users:
+    #             error_resp = json.dumps({"status": "error", "code": "CONFLICT", "message": "User exists"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #
+    #         else:
+    #             new_user = User()
+    #             new_user.username = username
+    #             app_state.users[username] = new_user
+    #
+    #             success_resp = json.dumps({"status": "ok", "operation": "register", "username": username}) + "\n"
+    #             cli_sock.send(success_resp.encode('utf-8'))
+    #
+    # @staticmethod
+    # def handle_login(args: list[str], cli_sock, app_state):
+    #     """Handle login from TCP side."""
+    #     if not args:
+    #         error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing username"}) + "\n"
+    #         cli_sock.send(error_resp.encode('utf-8'))
+    #         return
+    #
+    #     username = args[0]
+    #
+    #     with app_state.id_lock:
+    #         if username not in app_state.users:
+    #             error_resp = json.dumps(
+    #                 {"status": "error", "code": "NOT_FOUND", "message": "User does not exist"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #         else:
+    #             # Bind the socket to the user
+    #             app_state.active_conns[cli_sock] = username
+    #
+    #             # Basic login, no security since that's out of scope
+    #             success_resp = json.dumps({"status": "ok", "operation": "login", "username": username}) + "\n"
+    #             cli_sock.send(success_resp.encode('utf-8'))
+    #
+    # @staticmethod
+    # def handle_join(args: list[str], cli_sock, app_state):
+    #     if not args:
+    #         error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel name"}) + "\n"
+    #         cli_sock.send(error_resp.encode('utf-8'))
+    #         return
+    #
+    #     channel_name = args[0]
+    #
+    #     with app_state.id_lock:
+    #         # Identify the user
+    #         username = app_state.active_conns.get(cli_sock)
+    #         if not username:
+    #             error_resp = json.dumps({"status": "error", "code": "NOT_AUTHENTICATED", "message": "You must login first"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #             return
+    #
+    #         # Validate channel format
+    #         if not Channel.is_valid_channel(channel_name):
+    #             error_resp = json.dumps({"status": "error", "code": "INVALID_CHANNEL", "message": "Invalid channel format"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #             return
+    #
+    #         # Create channel if it does not exist
+    #         if channel_name not in app_state.channels:
+    #             new_channel = Channel()
+    #             new_channel.name = channel_name
+    #             app_state.channels[channel_name] = new_channel
+    #
+    #         # Add user to channel members
+    #         app_state.channels[channel_name].members.add(username)
+    #         app_state.users[username].channels.add(channel_name)
+    #
+    #         success_resp = json.dumps({"status": "ok", "operation": "join", "channel": channel_name}) + "\n"
+    #         cli_sock.send(success_resp.encode('utf-8'))
+    #
+    # @staticmethod
+    # def handle_leave(args: list[str], cli_sock, app_state):
+    #     if not args:
+    #         error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel name"}) + "\n"
+    #         cli_sock.send(error_resp.encode('utf-8'))
+    #         return
+    #
+    #     channel_name = args[0]
+    #
+    #     with app_state.id_lock:
+    #         # Check if user is logged in
+    #         username = app_state.active_conns.get(cli_sock)
+    #         if not username:
+    #             error_resp = json.dumps({"status": "error", "code": "NOT_AUTHENTICATED", "message": "You must login first"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #             return
+    #
+    #         # Check if channel exists
+    #         if channel_name not in app_state.channels:
+    #             error_resp = json.dumps({"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #             return
+    #
+    #         # Remove the user from the channel
+    #         # discard() instead of remove() to avoid crashing if the user wasn't in the set
+    #         app_state.channels[channel_name].members.discard(username)
+    #         app_state.users[username].channels.discard(channel_name)
+    #
+    #         success_resp = json.dumps({"status": "ok", "operation": "leave", "channel": channel_name}) + "\n"
+    #         cli_sock.send(success_resp.encode('utf-8'))
+    #
+    # @staticmethod
+    # def handle_logout(args: list[str], cli_sock, app_state):
+    #     with app_state.id_lock:
+    #         # Check if user is actually logged in
+    #         if cli_sock in app_state.active_conns:
+    #             username = app_state.active_conns.pop(cli_sock)
+    #             success_resp = json.dumps({"status": "ok", "operation": "logout", "username": username}) + "\n"
+    #             cli_sock.send(success_resp.encode('utf-8'))
+    #         else:
+    #             error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Not logged in"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #
+    # @staticmethod
+    # def handle_list(args: list[str], cli_sock, app_state):
+    #     if not args:
+    #         error_resp = json.dumps(
+    #             {"status": "error", "code": "BAD_REQUEST", "message": "Missing LIST arguments"}) + "\n"
+    #         cli_sock.send(error_resp.encode('utf-8'))
+    #         return
+    #
+    #     sub_command = args[0].upper()
+    #
+    #     # LIST CHANNELS
+    #     if sub_command == "CHANNELS":
+    #         with app_state.id_lock:
+    #             channel_list = list(app_state.channels.keys())
+    #
+    #         success_resp = json.dumps({"status": "ok", "channels": channel_list}) + "\n"
+    #         cli_sock.send(success_resp.encode('utf-8'))
+    #
+    #     # LIST USERS
+    #     elif sub_command == "USERS":
+    #         if len(args) < 2:
+    #             error_resp = json.dumps(
+    #                 {"status": "error", "code": "BAD_REQUEST", "message": "Missing channel name"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #             return
+    #
+    #         channel_name = args[1]
+    #         with app_state.id_lock:
+    #             if channel_name not in app_state.channels:
+    #                 error_resp = json.dumps(
+    #                     {"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n"
+    #                 cli_sock.send(error_resp.encode('utf-8'))
+    #                 return
+    #
+    #             # Sets are not JSON serializable, convert to a list
+    #             member_list = list(app_state.channels[channel_name].members)
+    #
+    #         success_resp = json.dumps({"status": "ok", "channel": channel_name, "users": member_list}) + "\n"
+    #         cli_sock.send(success_resp.encode('utf-8'))
+    #
+    #     else:
+    #         error_resp = json.dumps(
+    #             {"status": "error", "code": "BAD_REQUEST", "message": "Unknown LIST command"}) + "\n"
+    #         cli_sock.send(error_resp.encode('utf-8'))
+    #
+    # @staticmethod
+    # def handle_send(args: list[str], cli_sock, app_state):
+    #     if len(args) < 2:
+    #         error_resp = json.dumps(
+    #             {"status": "error", "code": "BAD_REQUEST", "message": "Missing channel or text"}) + "\n"
+    #         cli_sock.send(error_resp.encode('utf-8'))
+    #         return
+    #
+    #     channel_name = args[0]
+    #     # SEND splits incoming string with " ", need to reconstruct full message
+    #     text = " ".join(args[1:])
+    #
+    #     with app_state.id_lock:
+    #         username = app_state.active_conns.get(cli_sock)
+    #         if not username:
+    #             error_resp = json.dumps(
+    #                 {"status": "error", "code": "NOT_AUTHENTICATED", "message": "Not logged in"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #             return
+    #
+    #         if channel_name not in app_state.channels:
+    #             error_resp = json.dumps(
+    #                 {"status": "error", "code": "NOT_FOUND", "message": "Channel does not exist"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #             return
+    #
+    #         if username not in app_state.channels[channel_name].members:
+    #             error_resp = json.dumps(
+    #                 {"status": "error", "code": "BAD_REQUEST", "message": "You must join the channel first"}) + "\n"
+    #             cli_sock.send(error_resp.encode('utf-8'))
+    #             return
+    #
+    #         # Create and store the message
+    #         msg = Message()
+    #         msg.message_id = app_state.get_next_message_id()
+    #         msg.channel = channel_name
+    #         msg.username = username
+    #         msg.text = text
+    #
+    #         app_state.channels[channel_name].messages[msg.message_id] = msg
+    #
+    #         success_resp = json.dumps({"status": "ok", "operation": "send", "message_id": msg.message_id}) + "\n"
+    #         cli_sock.send(success_resp.encode('utf-8'))
+    #
+    # @staticmethod
+    # def handle_history(args: list[str], cli_sock, app_state):
+    #     if not args:
+    #         cli_sock.send(json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Missing channel"}) + "\n")
+    #         return
+    #
+    #     channel_name = args[0]
+    #     limit = None
+    #     if len(args) > 1 and args[1].isdigit():
+    #         limit = int(args[1])
+    #
+    #     with app_state.id_lock:
+    #         if channel_name not in app_state.channels:
+    #             cli_sock.send(
+    #                 json.dumps({"status": "error", "code": "NOT_FOUND", "message": "Channel not found"}) + "\n")
+    #             return
+    #
+    #         # Get all messages as a list of dictionaries
+    #         all_messages = [msg.to_dict() for msg in app_state.channels[channel_name].messages.values()]
+    #
+    #         # Apply limit (ex. last 20 messages)
+    #         if limit:
+    #             all_messages = all_messages[-limit:]
+    #
+    #         success_resp = json.dumps({"status": "ok", "channel": channel_name, "messages": all_messages}) + "\n"
+    #         cli_sock.send(success_resp.encode('utf-8'))
+    #
+    # def handle_new_client(self, cli_sock, addr, app_state):
+    #     COMMAND_HANDLERS = {
+    #         "REGISTER": self.handle_register,
+    #         "LOGIN": self.handle_login,
+    #         "JOIN": self.handle_join,
+    #         "LIST": self.handle_list,
+    #         "LEAVE": self.handle_leave,
+    #         "LOGOUT": self.handle_logout,
+    #         "SEND": self.handle_send,
+    #         "HISTORY": self.handle_history
+    #     }
+    #
+    #     while True:
+    #         try:
+    #             buffer = cli_sock.recv(1024).decode('utf-8')
+    #
+    #             # Client disconnected normally
+    #             if not buffer:
+    #                 break
+    #
+    #             lines = buffer.strip().split('\n')
+    #             for line in lines:
+    #                 if not line:
+    #                     continue
+    #
+    #                 parts = line.split(" ")
+    #                 command = parts[0].upper()
+    #                 args = parts[1:]  # Everything after the command
+    #
+    #                 handler_function = COMMAND_HANDLERS.get(command)
+    #
+    #                 if handler_function:
+    #                     handler_function(args, cli_sock, app_state)
+    #                 else:
+    #                     error_resp = json.dumps({"status": "error", "code": "BAD_REQUEST", "message": "Unknown command"}) + "\n"
+    #                     cli_sock.send(error_resp.encode('utf-8'))
+    #
+    #         # Client crashed or force-closed
+    #         except ConnectionResetError:
+    #             break
+    #
+    #     # Cleanup
+    #     dc_user = None
+    #
+    #     with app_state.id_lock:
+    #         if cli_sock in app_state.active_conns:
+    #             # Remove them from the active connections map
+    #             dc_user = app_state.active_conns.pop(cli_sock)
+    #
+    #         # Remove from all channels and user list
+    #         if dc_user:
+    #             for channel in app_state.channels.values():
+    #                 channel.members.discard(dc_user)
+    #             app_state.users.pop(dc_user, None)
+    #
+    #     cli_sock.close()
+    #
+    #     if dc_user:
+    #         print(f"User '{dc_user}' disconnected {addr}.")
+    #     else:
+    #         print(f"Unauthenticated client disconnected from {addr}.")
 
 
 def launch_server(HOST, PORT):
