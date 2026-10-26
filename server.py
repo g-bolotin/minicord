@@ -122,37 +122,29 @@ class HTTPHandler(BaseHTTPRequestHandler):
         path_parts = decoded_path.strip("/").split("/")
 
         # POST user
-        if self.path == "/users":
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            data = json.loads(post_data.decode('utf-8'))
+        if decoded_path == "/users":
+            try:
+                # Load json file
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length) if content_length > 0 else b""
+                data = json.loads(post_data.decode('utf-8'))
 
-            username = data.get("username")
+            except (ValueError, json.JSONDecodeError):
+                self.send_response(HTTP_CODES.get("BAD_REQUEST"))
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status": "error", "code": "INVALID_JSON", "message": "Invalid JSON payload"}')
+                return
 
-            with self.app_state.id_lock:
-                # Username already exists
-                if username in self.app_state.users:
-                    self.send_response(HTTP_CODES.get("CONFLICT"))
-                    self.end_headers()
-                    self.wfile.write(b'{"status": "error", "code": "CONFLICT", "message": "User exists"}')
+            # Pull username data from json, create user
+            username = data.get("username") if isinstance(data, dict) else None
+            http_code, resp_body = create_user_globally(self.app_state, username)
 
-                # Create new user
-                elif User.is_valid_username(username):
-                    new_user = User()
-                    new_user.username = username
-                    self.app_state.users[username] = new_user
-
-                    self.send_response(HTTP_CODES.get("CREATED"))
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-
-                    response = json.dumps({"username": username})
-                    self.wfile.write(response.encode('utf-8'))
-
-                else:
-                    self.send_response(HTTP_CODES.get("BAD_REQUEST"))
-                    self.end_headers()
-                    self.wfile.write(b'{"status": "error", "code": "BAD_REQUEST", "message": "Username contains invalid characters"}')
+            # Send response
+            self.send_response(http_code)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_body).encode('utf-8'))
 
         # POST channel member
         # Path format: /channels/{channel_name}/members
@@ -449,6 +441,83 @@ def send_peer_message(app_state: AppState, target_id: str, payload: dict, timeou
         return None
 
 
+def create_user_globally(app_state: AppState, username: str) -> tuple[int, dict]:
+    """
+    User creation is handled by the group leader so registrations across different servers
+    can't create duplicate usernames. The created user is replicated across all live peers.
+    """
+    if not username or not isinstance(username, str):
+        return HTTP_CODES["BAD_REQUEST"], {
+            "status": "error",
+            "code": "BAD_REQUEST",
+            "message": "Missing username"
+        }
+
+    if not User.is_valid_username(username):
+        return HTTP_CODES["BAD_REQUEST"], {
+            "status": "error",
+            "code": "BAD_REQUEST",
+            "message": "Username contains invalid characters"
+        }
+
+    with app_state.id_lock:
+        leader_id = app_state.current_leader
+        is_leader = (leader_id == app_state.server_id) or not app_state.peer_alive.get(leader_id, True)
+
+    # If this server is NOT the leader, ask the leader to authorize & replicate the user
+    if not is_leader:
+        req = {
+            "type": "USER_SYNC",
+            "action": "CREATE",
+            "username": username,
+            "from": app_state.server_id
+        }
+        resp = send_peer_message(app_state, leader_id, req, timeout=2.0, expect_response=True)
+        if resp and "http_code" in resp and "body" in resp:
+            # Ensure local copy is also stored immediately on success
+            if resp["http_code"] == HTTP_CODES["CREATED"]:
+                with app_state.id_lock:
+                    if username not in app_state.users:
+                        u = User()
+                        u.username = username
+                        app_state.users[username] = u
+            return resp["http_code"], resp["body"]
+
+    # Fallback if the leader just failed before heartbeat timeout caught it.
+    # Process locally and replicate to live peers
+
+    # Process as leader or fallback
+    with app_state.id_lock:
+        if username in app_state.users:
+            return HTTP_CODES["CONFLICT"], {
+                "status": "error",
+                "code": "CONFLICT",
+                "message": "User exists"
+            }
+
+        new_user = User()
+        new_user.username = username
+        app_state.users[username] = new_user
+
+        alive_peers = [
+            sid for sid in app_state.servers_config
+            if sid != app_state.server_id and app_state.peer_alive.get(sid, True)
+        ]
+
+    # Replicate the new user to all live peers outside lock
+    for peer_id in alive_peers:
+        rep_msg = {
+            "type": "USER_SYNC",
+            "action": "REPLICATE",
+            "username": username,
+            "from": app_state.server_id
+        }
+        send_peer_message(app_state, peer_id, rep_msg, timeout=2.0, expect_response=True)
+
+    print(f"[Server {app_state.server_id}] Registered user '{username}' and replicated to peers {alive_peers}", flush=True)
+    return HTTP_CODES["CREATED"], {"username": username}
+
+
 def trigger_leader_selection(app_state: AppState):
     """Selects the highest priority available server as leader and announces if self is chosen."""
     announce_targets = []
@@ -594,9 +663,30 @@ class Server:
 
     @staticmethod
     def handle_user_sync(msg: dict, cli_sock: socket.socket, app_state: AppState):
-        """Global user registration & replication"""
-        # TODO: global user registration and replication
-        pass
+        """Handles global user creation at leader and user replication at peers."""
+        action = msg.get("action")
+        username = msg.get("username")
+
+        if action == "REPLICATE":
+            if username:
+                with app_state.id_lock:
+                    if username not in app_state.users:
+                        new_user = User()
+                        new_user.username = username
+                        app_state.users[username] = new_user
+                print(f"[Server {app_state.server_id}] Replicated user '{username}' from Server {msg.get('from')}",
+                      flush=True)
+            ack = {"type": "USER_SYNC_ACK", "status": "ok", "username": username}
+            cli_sock.sendall((json.dumps(ack) + "\n").encode('utf-8'))
+
+        elif action == "CREATE":
+            http_code, body = create_user_globally(app_state, username)
+            resp = {
+                "type": "USER_SYNC_RESPONSE",
+                "http_code": http_code,
+                "body": body
+            }
+            cli_sock.sendall((json.dumps(resp) + "\n").encode('utf-8'))
 
     def handle_peer_connection(self, cli_sock: socket.socket, addr, app_state: AppState):
         PEER_HANDLERS = {
