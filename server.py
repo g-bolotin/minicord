@@ -495,6 +495,54 @@ def trigger_leader_selection(app_state: AppState):
         print(f"[Server {app_state.server_id}] Sending LEADER_ANNOUNCE (leader={new_leader_id}) to Server {target_id}", flush=True)
         send_peer_message(app_state, target_id, announce_msg, timeout=2.0, expect_response=True)
 
+
+def heartbeat_monitor_loop(app_state: AppState):
+    """Sends PING heartbeats to peers every 2 seconds."""
+    sequence = 1
+    peer_ids = [sid for sid in app_state.servers_config if sid != app_state.server_id]
+
+    while True:
+        time.sleep(2.0)  # 2s wait
+
+        for peer_id in peer_ids:
+            ping_msg = {
+                "type": "PING",
+                "from": app_state.server_id,
+                "sequence": sequence
+            }
+            resp = send_peer_message(app_state, peer_id, ping_msg, timeout=2.0, expect_response=True)
+
+            leader_needs_update = False
+
+            # Valid PONG must match the request sequence number
+            if resp and resp.get("type") == "PONG" and resp.get("sequence") == sequence:
+                with app_state.id_lock:
+                    was_alive = app_state.peer_alive.get(peer_id, True)
+                    app_state.missed_heartbeats[peer_id] = 0
+                    app_state.peer_alive[peer_id] = True
+                    if not was_alive:
+                        print(f"[Server {app_state.server_id}] Peer Server {peer_id} is reachable again.", flush=True)
+            else:
+                with app_state.id_lock:
+                    app_state.missed_heartbeats[peer_id] += 1
+                    missed = app_state.missed_heartbeats[peer_id]
+
+                    if app_state.peer_alive.get(peer_id, True):
+                        print(f"[Server {app_state.server_id}] Missed heartbeat from Server {peer_id} ({missed}/3)", flush=True)
+
+                    # Mark unavailable after 3 consecutive missed heartbeats
+                    if missed >= 3 and app_state.peer_alive.get(peer_id, True):
+                        app_state.peer_alive[peer_id] = False
+                        print(f"[Server {app_state.server_id}] Server {peer_id} marked UNAVAILABLE after 3 missed heartbeats.", flush=True)
+                        if app_state.current_leader == peer_id:
+                            leader_needs_update = True
+
+            if leader_needs_update:
+                trigger_leader_selection(app_state)
+
+        sequence += 1
+
+
 class Server:
     def __init__(self, HOST, TCP_PORT, app_state: AppState):
         self.app_state = app_state
