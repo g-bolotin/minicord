@@ -11,6 +11,7 @@ import json
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 import argparse
+import time
 
 USERNAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 CHANNEL_PATTERN = re.compile(r'^#[a-zA-Z0-9_-]+$')
@@ -447,6 +448,52 @@ def send_peer_message(app_state: AppState, target_id: str, payload: dict, timeou
     except (socket.timeout, ConnectionError, OSError, json.JSONDecodeError):
         return None
 
+
+def trigger_leader_selection(app_state: AppState):
+    """Selects the highest priority available server as leader and announces if self is chosen."""
+    announce_targets = []
+    new_leader_id = None
+
+    with app_state.id_lock:
+        # Keep Self marked alive
+        app_state.peer_alive[app_state.server_id] = True
+
+        # Find all currently alive servers
+        alive_servers = [
+            cfg for sid, cfg in app_state.servers_config.items()
+            if app_state.peer_alive.get(sid, False)
+        ]
+        if not alive_servers:
+            return
+
+        # Selection: highest priority value wins (C=3, B=2, A=1)
+        highest_server = max(alive_servers, key=lambda s: s["priority"])
+        new_leader_id = highest_server["id"]
+
+        if app_state.current_leader != new_leader_id:
+            old_leader = app_state.current_leader
+            app_state.current_leader = new_leader_id
+            print(
+                f"[Server {app_state.server_id}] Leader {old_leader} unavailable. "
+                f"Selected new leader: Server {new_leader_id} (priority {highest_server['priority']})",
+                flush=True
+            )
+
+            # If this server is the newly selected leader, announce to surviving peers
+            if new_leader_id == app_state.server_id:
+                announce_targets = [
+                    sid for sid in app_state.servers_config
+                    if sid != app_state.server_id and app_state.peer_alive.get(sid, False)
+                ]
+
+    # Send LEADER_ANNOUNCE outside lock so network I/O doesn't block local state
+    for target_id in announce_targets:
+        announce_msg = {
+            "type": "LEADER_ANNOUNCE",
+            "leader": new_leader_id
+        }
+        print(f"[Server {app_state.server_id}] Sending LEADER_ANNOUNCE (leader={new_leader_id}) to Server {target_id}", flush=True)
+        send_peer_message(app_state, target_id, announce_msg, timeout=2.0, expect_response=True)
 
 class Server:
     def __init__(self, HOST, TCP_PORT, app_state: AppState):
