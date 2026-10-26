@@ -39,10 +39,19 @@ class User:
 
 
 class Channel:
-    def __init__(self):
-        self.name = ""  # Channel names must begin with # and may contain letters, digits, hyphens, and underscores. Must be unique.
+    def __init__(self, name: str = "", primary: str = "", backup: str = ""):
+        self.name = name  # Channel names must begin with # and may contain letters, digits, hyphens, and underscores. Must be unique.
+        self.primary = primary
+        self.backup = backup
         self.messages: dict[int, Message] = {}  # MID : Message
         self.members = set()
+        self._message_id_counter = 1
+
+    def get_next_message_id(self) -> int:
+        """Assigns sequential unique message IDs per channel."""
+        current_id = self._message_id_counter
+        self._message_id_counter += 1
+        return current_id
 
     @staticmethod
     def is_valid_channel(channel_name: str) -> bool:
@@ -69,20 +78,43 @@ class Message:
 
 class AppState:
     """Maintains local application state rather than external database."""
-    def __init__(self):
-        self._message_id_counter = 1
+    def __init__(self, server_id: str, servers_config: list[dict]):
         self.id_lock = threading.RLock()  # Allows same thread to reacquire lock safely
+
+        self.server_id = server_id
+        # Map server_id ("A", "B", "C") -> config dict
+        self.servers_config: dict[str, dict] = {s["id"]: s for s in servers_config}
+        self.self_config = self.servers_config[server_id]
+
+        # Track availability and missed heartbeats for each server
+        self.peer_alive: dict[str, bool] = {s["id"]: True for s in servers_config}
+        self.missed_heartbeats: dict[str, int] = {s["id"]: 0 for s in servers_config}
+
+        # Highest priority server at startup is initial leader (Server C, priority 3)
+        highest_server = max(servers_config, key=lambda s: s["priority"])
+        self.current_leader: str = highest_server["id"]
 
         self.users: dict[str, User] = {}  # username : User
         self.channels: dict[str, Channel] = {}  # channel name : Channel
-        self.active_conns: dict[socket.socket, str] = {}  # active socket : username
 
-    def get_next_message_id(self):
-        """Message UIDs are determined at app run and incremental."""
-        with self.id_lock:
-            current_id = self._message_id_counter
-            self._message_id_counter += 1
-            return current_id
+        # Pre-populate the required default channels and ownership rules
+        self._init_default_channels()
+
+    def _init_default_channels(self):
+        default_channels = [
+            ("#cs249", "A", "B"),
+            ("#distributed", "B", "C"),
+            ("#systems", "C", "A"),
+        ]
+        for name, primary, backup in default_channels:
+            self.channels[name] = Channel(name=name, primary=primary, backup=backup)
+
+    # def get_next_message_id(self):
+    #     """Message UIDs are determined at app run and incremental."""
+    #     with self.id_lock:
+    #         current_id = self._message_id_counter
+    #         self._message_id_counter += 1
+    #         return current_id
 
 
 class HTTPHandler(BaseHTTPRequestHandler):
@@ -205,7 +237,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
                     return
 
                 msg = Message()
-                msg.message_id = self.app_state.get_next_message_id()
+                msg.message_id = self.app_state.channels[channel_name].get_next_message_id()
                 msg.channel = channel_name
                 msg.username = username
                 msg.text = text
@@ -230,7 +262,34 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.send_response(HTTP_CODES.get("SUCCESS"))
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
+            response = json.dumps({
+                "status": "ok",
+                "server_id": self.app_state.server_id
+            })
+            self.wfile.write(response.encode('utf-8'))
+
+        elif decoded_path == "/servers":
+            with self.app_state.id_lock:
+                servers_list = [
+                    {"server_id": sid, "alive": self.app_state.peer_alive[sid]}
+                    for sid in sorted(self.app_state.servers_config.keys())
+                ]
+            self.send_response(HTTP_CODES.get("SUCCESS"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"servers": servers_list}).encode('utf-8'))
+
+        elif decoded_path == "/leader":
+            with self.app_state.id_lock:
+                leader_id = self.app_state.current_leader
+                leader_alive = self.app_state.peer_alive.get(leader_id, False)
+            self.send_response(HTTP_CODES.get("SUCCESS"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "leader": leader_id,
+                "alive": leader_alive
+            }).encode('utf-8'))
 
         # GET users
         elif decoded_path == "/users":
@@ -684,26 +743,33 @@ def launch_server(HOST, PORT):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Mini Discord Server")
-    parser.add_argument('--host', type=str, default='127.0.0.1', help="Host IP address")
-    parser.add_argument('--tcp-port', type=int, default='9000', help="TCP port number")
-    parser.add_argument('--http-port', type=int, default='8080', help="HTTP port number")
+    parser = argparse.ArgumentParser(description="Mini Discord Distributed Server")
+    parser.add_argument('--config', type=str, default='servers.json', help="Path to servers.json config file")
+    parser.add_argument('--id', type=str, default='A', choices=['A', 'B', 'C'], help="Server ID (A, B, or C)")
 
     args = parser.parse_args()
-    shared_state = AppState()
 
-    # Launch TCP Server in a background thread
-    tcp_server = Server(args.host, args.tcp_port, shared_state)
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config_data = json.load(f)
+
+    servers_list = config_data.get("servers", [])
+    shared_state = AppState(args.id, servers_list)
+
+    host = shared_state.self_config["host"]
+    http_port = shared_state.self_config["http_port"]
+    peer_port = shared_state.self_config["peer_port"]
+
+    # Launch Peer TCP Server in a background thread
+    tcp_server = Server(host, peer_port, shared_state)
     t = Thread(target=tcp_server.listen, daemon=True)
     t.start()
 
     # Launch HTTP Server on the main thread
-    # Use a lambda to inject the shared_state into the HTTPHandler
     handler = lambda *a, **kwargs: HTTPHandler(shared_state, *a, **kwargs)
-    http_server = ThreadingHTTPServer((args.host, args.http_port), handler)
+    http_server = ThreadingHTTPServer((host, http_port), handler)
 
-    print(f"HTTP Server is waiting for connections on {args.http_port}...\n")
+    print(f"[Server {args.id}] HTTP listening on {host}:{http_port}, Peer TCP on {host}:{peer_port} (Leader: {shared_state.current_leader})")
     try:
         http_server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down servers.")
+        print(f"\n[Server {args.id}] Shutting down.")
