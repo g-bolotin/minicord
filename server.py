@@ -978,6 +978,10 @@ if __name__ == '__main__':
     t = Thread(target=tcp_server.listen, daemon=True)
     t.start()
 
+    # Launch Heartbeat Monitor in a background thread
+    hb_thread = Thread(target=heartbeat_monitor_loop, args=(shared_state,), daemon=True)
+    hb_thread.start()
+
     # Launch HTTP Server on the main thread
     handler = lambda *a, **kwargs: HTTPHandler(shared_state, *a, **kwargs)
     http_server = ThreadingHTTPServer((host, http_port), handler)
