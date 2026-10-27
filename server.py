@@ -21,6 +21,7 @@ HTTP_CODES = {
     "BAD_REQUEST": 400,
     "NOT_AUTHENTICATED": 401,
     "NOT_FOUND": 404,
+    "METHOD_NOT_ALLOWED": 405,
     "CONFLICT": 409,
     "INVALID_USERNAME": 412,
     "INVALID_CHANNEL": 412,
@@ -188,6 +189,13 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(resp_body).encode('utf-8'))
 
+        # Unknown Command
+        else:
+            self.send_response(HTTP_CODES.get("NOT_FOUND"))
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status": "error", "code": "NOT_FOUND", "message": "Endpoint not found"}')
+
     def do_GET(self):
         # Separate query params
         parsed_url = urllib.parse.urlparse(self.path)
@@ -294,8 +302,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
         # Unknown command
         else:
             self.send_response(HTTP_CODES.get("NOT_FOUND"))
+            self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(b'{"status": "error", "message": "Endpoint not found"}')
+            self.wfile.write(b'{"status": "error", "code": "NOT_FOUND", "message": "Endpoint not found"}')
 
     def do_DELETE(self):
         # %23 to #
@@ -316,11 +325,25 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(resp_body).encode('utf-8'))
 
+        # Unknown Command
         else:
             self.send_response(HTTP_CODES.get("NOT_FOUND"))
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(b'{"status": "error", "code": "NOT_FOUND", "message": "Endpoint not found"}')
+
+    # HTTP error handling for unsupported functions
+    def _send_method_not_allowed(self):
+        self.send_response(HTTP_CODES.get("METHOD_NOT_ALLOWED", 405))
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{"status": "error", "code": "METHOD_NOT_ALLOWED", "message": "Unsupported HTTP method"}')
+
+    def do_PUT(self):
+        self._send_method_not_allowed()
+
+    def do_PATCH(self):
+        self._send_method_not_allowed()
 
 
 def send_peer_message(app_state: AppState, target_id: str, payload: dict, timeout: float = 2.0, expect_response: bool = True) -> dict | None:
