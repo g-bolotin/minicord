@@ -637,6 +637,7 @@ def execute_channel_op_on_primary(
             msg.text = text
             channel.messages[msg.message_id] = msg
             msg_dict = msg.to_dict()
+            backup_id = channel.backup
 
         # Message History
         elif operation == "HISTORY":
@@ -662,8 +663,42 @@ def execute_channel_op_on_primary(
                 "message": f"Unsupported channel operation: {operation}"
             }
 
-    # TODO: trigger backup replication here after SEND
-    return HTTP_CODES["CREATED"], msg_dict
+        # Replicate newly created message from primary server to backup server
+        if backup_id and backup_id != app_state.server_id:
+            rep_req = {
+                "type": "REPLICATE",
+                "channel": channel_name,
+                "message": {
+                    "message_id": msg_dict["message_id"],
+                    "username": msg_dict["username"],
+                    "text": msg_dict["text"]
+                }
+            }
+            print(
+                f"[Server {app_state.server_id}] Replicating message {msg_dict['message_id']} in {channel_name} "
+                f"-> Backup Server {backup_id}",
+                flush=True
+            )
+            ack = send_peer_message(app_state, backup_id, rep_req, timeout=2.0, expect_response=True)
+            if (
+                    ack
+                    and ack.get("type") == "REPLICATE_ACK"
+                    and ack.get("channel") == channel_name
+                    and ack.get("message_id") == msg_dict["message_id"]
+            ):
+                print(
+                    f"[Server {app_state.server_id}] Received REPLICATE_ACK for {channel_name} "
+                    f"message {msg_dict['message_id']} from Backup Server {ack.get('from')}",
+                    flush=True
+                )
+            else:
+                print(
+                    f"[Server {app_state.server_id}] Warning: Backup Server {backup_id} did not acknowledge "
+                    f"replication for {channel_name} message {msg_dict['message_id']} (continuing as Primary)",
+                    flush=True
+                )
+
+        return HTTP_CODES["CREATED"], msg_dict
 
 
 def route_channel_request(
@@ -799,9 +834,48 @@ class Server:
 
     @staticmethod
     def handle_replicate(msg: dict, cli_sock: socket.socket, app_state: AppState):
-        """Backup message replication"""
-        # TODO: backup message replication
-        pass
+        """Stores a replicated message on the specified backup server and returns REPLICATE_ACK."""
+        # Get fields
+        channel_name = msg.get("channel", "")
+        msg_data = msg.get("message", {})
+        msg_id = msg_data.get("message_id")
+        username = msg_data.get("username", "")
+        text = msg_data.get("text", "")
+
+        # Check if message exists for replication
+        # If channel doesn't exist as a replica, update app state with new replica channel
+        if channel_name and msg_id is not None:
+            with app_state.id_lock:
+                if channel_name not in app_state.channels:
+                    app_state.channels[channel_name] = Channel(name=channel_name)
+
+                channel = app_state.channels[channel_name]
+
+                # Check that duplicate replication messages don't create duplicate records
+                if msg_id not in channel.messages:
+                    replicated_msg = Message()
+                    replicated_msg.message_id = msg_id
+                    replicated_msg.channel = channel_name
+                    replicated_msg.username = username
+                    replicated_msg.text = text
+                    channel.messages[msg_id] = replicated_msg
+
+                    if msg_id >= channel._message_id_counter:
+                        channel._message_id_counter = msg_id + 1
+
+            print(
+                f"[Server {app_state.server_id}] Backup stored replicated message_id={msg_id} "
+                f"for {channel_name} (from user '{username}')",
+                flush=True
+            )
+
+        ack = {
+            "type": "REPLICATE_ACK",
+            "channel": channel_name,
+            "message_id": msg_id,
+            "from": app_state.server_id
+        }
+        cli_sock.sendall((json.dumps(ack) + "\n").encode('utf-8'))
 
     @staticmethod
     def handle_forward(msg: dict, cli_sock: socket.socket, app_state: AppState):
@@ -849,6 +923,7 @@ class Server:
         if action == "REPLICATE":
             if username:
                 with app_state.id_lock:
+                    # If username doesn't exist as a replica, create the user and update app state
                     if username not in app_state.users:
                         new_user = User()
                         new_user.username = username
