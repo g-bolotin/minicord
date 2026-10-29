@@ -28,14 +28,14 @@ Start all three server processes concurrently using: ./run.sh --config servers.j
 
 User-Sharing Mechanism
 -------------------------
-User registrations (POST /users) are serialized through the current cluster leader with the TCP socket USER_SYNC ("action": "CREATE") message.
+User registrations (POST /users) are serialized through the current cluster leader (for example, Server C initially) with the TCP socket USER_SYNC ("action": "CREATE") message.
 The leader checks username format and uniqueness under its reentrant lock (RLock) to prevent concurrent duplicate registrations across different servers.
 Once the user is created, the leader broadcasts a USER_SYNC ("action": "REPLICATE") message over TCP to all healthy peers so every server holds the full user set in local memory.
-GET /users reads directly from local synchronized memory.
+GET /users reads directly from local memory.
 
 Channel Ownership and Request-Forwarding Design
 --------------------------------------------------
-Default channels are pre-populated on all servers at startup with fixed ownership.
+Default channels are established on all servers at startup with fixed ownership.
 - #cs249:       Primary = A, Backup = B
 - #distributed: Primary = B, Backup = C
 - #systems:     Primary = C, Backup = A
