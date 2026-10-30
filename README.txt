@@ -92,13 +92,13 @@ Testing Instructions
    curl "http://127.0.0.1:8101/leader"
    curl "http://127.0.0.1:8102/leader"
 
-Demo Video Timestamps
-------------------------------------
-- Step 1 (Start All Three Servers):                 0:00
-- Step 2 (Verify Health):                           0:45
-- Step 3 (Verify Initial Process & Leader Status):  1:30
-- Step 4 (Demonstrate User Sharing):                2:15
-- Step 5 (Demonstrate Request Forwarding):          3:30
-- Step 6 (Demonstrate Message Replication):         5:00
-- Step 7 (Demonstrate Failure Detection):           6:15
-- Step 8 (Demonstrate Leader Selection):            7:30
+Demo Video Timestamps (Filename: cs249_pa2_demo.mp4)
+-------------------------------------------------------
+- Start All Three Servers:                 1:26
+- Verify Health:                           1:57
+- Verify Initial Process & Leader Status:  2:20
+- Demonstrate User Sharing:                2:55
+- Demonstrate Request Forwarding:          4:39
+- Demonstrate Message Replication:         8:00
+- Demonstrate Failure Detection:           8:12
+- Demonstrate Leader Selection:            8:50
